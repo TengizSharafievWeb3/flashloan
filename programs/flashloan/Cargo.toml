@@ -18,3 +18,4 @@ default = []
 [dependencies]
 anchor-lang = "0.23.0"
 anchor-spl = "0.23.0"
+sha2-const = "0.1.2"

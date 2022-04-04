@@ -1,5 +1,8 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, TokenAccount, MintTo, Burn, Transfer, Token};
+use anchor_lang::solana_program::sysvar::instructions;
+use std::convert::TryInto;
+use sha2_const::Sha256;
 
 declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 
@@ -31,10 +34,89 @@ pub mod flashloan {
 
     /// Receive tokens and mint lp tokens
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
+        // TODO: Add fee math
+
+        let key = ctx.accounts.flashloan.key();
+        let seeds = &[
+            key.as_ref(), FLASHLOAN_NAMESPACE.as_ref(),
+            &[ctx.accounts.flashloan.token_authority_bump],
+        ];
+        let singer_seeds = &[&seeds[..]];
+
+        let transfer_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.user_token.to_account_info(),
+                to: ctx.accounts.pool_token.to_account_info(),
+                authority: ctx.accounts.token_authority.to_account_info(),
+            },
+            singer_seeds,
+        );
+
+        token::transfer(transfer_ctx, amount)?;
+
+        let mint_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            MintTo {
+                mint: ctx.accounts.lp_token_mint.to_account_info(),
+                to: ctx.accounts.user_lp_token.to_account_info(),
+                authority: ctx.accounts.token_authority.to_account_info(),
+            },
+            singer_seeds,
+        );
+
+        token::mint_to(mint_ctx, amount)?;
+
+        emit!(DepositEvent {
+            token_mint: ctx.accounts.pool.token_mint,
+            token_amount: amount,
+            lp_amount: amount
+        });
+
         Ok(())
     }
 
+    /// Burn lp and pay out tokens
     pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
+        // TODO: Add fee math
+
+        let key = ctx.accounts.flashloan.key();
+        let seeds = &[
+            key.as_ref(), FLASHLOAN_NAMESPACE.as_ref(),
+            &[ctx.accounts.flashloan.token_authority_bump],
+        ];
+        let singer_seeds = &[&seeds[..]];
+
+        let burn_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Burn {
+                mint: ctx.accounts.lp_token_mint.to_account_info(),
+                to: ctx.accounts.user_lp_token.to_account_info(),
+                authority: ctx.accounts.token_authority.to_account_info(),
+            },
+            singer_seeds,
+        );
+
+        token::burn(burn_ctx, amount)?;
+
+        let transfer_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.pool_token.to_account_info(),
+                to: ctx.accounts.user_token.to_account_info(),
+                authority: ctx.accounts.token_authority.to_account_info(),
+            },
+            singer_seeds,
+        );
+
+        token::transfer(transfer_ctx, amount)?;
+
+        emit!(WithdrawEvent {
+            token_mint: ctx.accounts.pool.token_mint,
+            token_amount: amount,
+            lp_amount: amount
+        });
+
         Ok(())
     }
 
@@ -42,12 +124,104 @@ pub mod flashloan {
         Ok(())
     }
 
+    // Confirms there exists a matching repay, then lends tokens
     pub fn borrow(ctx: Context<Borrow>, amount: u64) -> Result<()> {
+        require!(!ctx.accounts.pool.borrowing, FlashLoanError::Borrowing);
+
+        let ixns = ctx.accounts.instructions.to_account_info();
+
+        // make sure this isn't a cpi call
+        let current_idx = instructions::load_current_index_checked(&ixns)? as usize;
+        let current_ixn = instructions::load_instruction_at_checked(current_idx, &ixns)?;
+        require!(current_ixn.program_id == *ctx.program_id, FlashLoanError::CpiBorrow);
+
+        // loop through instructions, looking for an equivalent repay to this borrow
+        let mut idx = current_idx + 1;
+        loop {
+            // get the next instruction, die if theres no more
+            if let Ok(ixn) = instructions::load_instruction_at_checked(idx, &ixns) {
+                // check if we have a toplevel repay toward the same pool
+                // if so, confirm the amount, otherwise next instruction
+                if ixn.program_id == *ctx.program_id
+                    && u64::from_be_bytes(ixn.data[..8].try_into().unwrap()) ==
+                        u64::from_be_bytes(Repay::SIGHASH[..8].try_into().unwrap())
+                    && ixn.accounts[2].pubkey == ctx.accounts.pool.key() {
+                    if u64::from_le_bytes(ixn.data[8..16].try_into().unwrap()) == amount {
+                        break;
+                    } else {
+                        return Err(error!(FlashLoanError::IncorrectRepay));
+                    }
+                } else {
+                    idx += 1;
+                }
+            } else {
+                return Err(error!(FlashLoanError::NoRepay));
+            }
+        }
+
+        let key = ctx.accounts.flashloan.key();
+        let seeds = &[
+            key.as_ref(), FLASHLOAN_NAMESPACE.as_ref(),
+            &[ctx.accounts.flashloan.token_authority_bump],
+        ];
+        let singer_seeds = &[&seeds[..]];
+
+        let transfer_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.pool_token.to_account_info(),
+                to: ctx.accounts.user_token.to_account_info(),
+                authority: ctx.accounts.token_authority.to_account_info(),
+            },
+            singer_seeds,
+        );
+
+        token::transfer(transfer_ctx, amount)?;
+        ctx.accounts.pool.borrowing = true;
+
+        emit!(BorrowEvent{
+            token_mint: ctx.accounts.pool.token_mint,
+            amount,
+        });
+
         Ok(())
     }
 
     pub fn repay(ctx: Context<Repay>, amount: u64) -> Result<()> {
+        let ixns = ctx.accounts.instructions.to_account_info();
+
+        // make sure this isn't a cpi call
+        let current_idx = instructions::load_current_index_checked(&ixns)? as usize;
+        let current_ixn = instructions::load_instruction_at_checked(current_idx, &ixns)?;
+        require!(current_ixn.program_id == *ctx.program_id, FlashLoanError::CpiBorrow);
+
+        let key = ctx.accounts.flashloan.key();
+        let seeds = &[
+            key.as_ref(), FLASHLOAN_NAMESPACE.as_ref(),
+            &[ctx.accounts.flashloan.token_authority_bump],
+        ];
+        let singer_seeds = &[&seeds[..]];
+
+        let transfer_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.user_token.to_account_info(),
+                to: ctx.accounts.pool_token.to_account_info(),
+                authority: ctx.accounts.token_authority.to_account_info(),
+            },
+            singer_seeds,
+        );
+
+        token::transfer(transfer_ctx, amount)?;
+        ctx.accounts.pool.borrowing = false;
+
+        emit!(RepayEvent{
+            token_mint: ctx.accounts.pool.token_mint,
+            amount,
+        });
+
         Ok(())
+
     }
 }
 
@@ -138,21 +312,166 @@ pub struct AddPool<'info> {
 }
 
 #[derive(Accounts)]
-pub struct Deposit {
+pub struct Deposit<'info> {
+    pub flashloan: Account<'info, FlashLoan>,
+
+    #[account(
+        seeds = [flashloan.key().as_ref(), FLASHLOAN_NAMESPACE.as_ref()],
+        bump = flashloan.token_authority_bump
+    )]
+    /// CHECK: Checked above, used only for bump calc
+    pub token_authority: UncheckedAccount<'info>,
+
+    #[account(
+        seeds = [flashloan.key().as_ref(), pool.token_mint.as_ref()],
+        bump = pool.bump
+    )]
+    pub pool: Account<'info, Pool>,
+
+    #[account(
+        mut,
+        seeds = [flashloan.key().as_ref(), TOKEN_NAMESPACE.as_ref(), pool.token_mint.as_ref()],
+        bump
+    )]
+    pub pool_token: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        seeds = [flashloan.key().as_ref(), LP_TOKEN_NAMESPACE.as_ref(), pool.token_mint.as_ref()],
+        bump
+    )]
+    pub lp_token_mint: Account<'info, Mint>,
+
+    #[account(mut, constraint =  user_token.mint == pool.token_mint)]
+    pub user_token: Account<'info, TokenAccount>,
+
+    #[account(mut, constraint = user_lp_token.mint == pool.lp_token_mint)]
+    pub user_lp_token: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
-pub struct Withdraw {
+pub struct Withdraw<'info> {
+    pub flashloan: Account<'info, FlashLoan>,
+
+    #[account(
+        seeds = [flashloan.key().as_ref(), FLASHLOAN_NAMESPACE.as_ref()],
+        bump = flashloan.token_authority_bump
+    )]
+    /// CHECK: Checked above, used only for bump calc
+    pub token_authority: UncheckedAccount<'info>,
+
+    #[account(
+        seeds = [flashloan.key().as_ref(), pool.token_mint.as_ref()],
+        bump = pool.bump
+    )]
+    pub pool: Account<'info, Pool>,
+
+    #[account(
+        mut,
+        seeds = [flashloan.key().as_ref(), TOKEN_NAMESPACE.as_ref(), pool.token_mint.as_ref()],
+        bump
+    )]
+    pub pool_token: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        seeds = [flashloan.key().as_ref(), LP_TOKEN_NAMESPACE.as_ref(), pool.token_mint.as_ref()],
+        bump
+    )]
+    pub lp_token_mint: Account<'info, Mint>,
+
+    #[account(mut, constraint =  user_token.mint == pool.token_mint)]
+    pub user_token: Account<'info, TokenAccount>,
+
+    #[account(mut, constraint = user_lp_token.mint == pool.lp_token_mint)]
+    pub user_lp_token: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
 pub struct MintVoucher {}
 
 #[derive(Accounts)]
-pub struct Borrow {}
+pub struct Borrow<'info> {
+    pub flashloan: Account<'info, FlashLoan>,
+
+    #[account(
+        seeds = [flashloan.key().as_ref(), FLASHLOAN_NAMESPACE.as_ref()],
+        bump = flashloan.token_authority_bump
+    )]
+    /// CHECK: Checked above, used only for bump calc
+    pub token_authority: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [flashloan.key().as_ref(), pool.token_mint.as_ref()],
+        bump = pool.bump
+    )]
+    pub pool: Account<'info, Pool>,
+
+    #[account(
+        mut,
+        seeds = [flashloan.key().as_ref(), TOKEN_NAMESPACE.as_ref(), pool.token_mint.as_ref()],
+        bump
+    )]
+    pub pool_token: Account<'info, TokenAccount>,
+
+    #[account(mut, constraint =  user_token.mint == pool.token_mint)]
+    pub user_token: Account<'info, TokenAccount>,
+
+    #[account(address = instructions::ID)]
+    /// CHECK: Checked above, sysvar::instructions
+    pub instructions: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, Token>,
+}
 
 #[derive(Accounts)]
-pub struct Repay {}
+pub struct Repay<'info> {
+    pub flashloan: Account<'info, FlashLoan>,
+
+    #[account(
+        seeds = [flashloan.key().as_ref(), FLASHLOAN_NAMESPACE.as_ref()],
+        bump = flashloan.token_authority_bump
+    )]
+    /// CHECK: Checked above, used only for bump calc
+    pub token_authority: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [flashloan.key().as_ref(), pool.token_mint.as_ref()],
+        bump = pool.bump
+    )]
+    pub pool: Account<'info, Pool>,
+
+    #[account(
+        mut,
+        seeds = [flashloan.key().as_ref(), TOKEN_NAMESPACE.as_ref(), pool.token_mint.as_ref()],
+        bump
+    )]
+    pub pool_token: Account<'info, TokenAccount>,
+
+    #[account(mut, constraint =  user_token.mint == pool.token_mint)]
+    pub user_token: Account<'info, TokenAccount>,
+
+    #[account(address = instructions::ID)]
+    /// CHECK: Checked above, sysvar::instructions
+    pub instructions: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+impl Repay<'_> {
+    // https://github.com/project-serum/anchor/blob/9e070870f4815849e99f19700d675638d3443b8f/lang/syn/src/codegen/program/dispatch.rs#L119
+    //
+    // Sha256("global::<rust-identifier>")[..8],
+    const SIGHASH: [u8; 32] = Sha256::new()
+        .update(b"global::repay")
+        .finalize();
+}
 
 #[account]
 pub struct FlashLoan {
@@ -175,4 +494,41 @@ pub struct Pool {
 
 impl Pool {
     const LEN: usize = 8 + 2 + 32*3;
+}
+
+// -----------------------------------------------------------------------------------------------
+
+#[event]
+pub struct DepositEvent {
+    pub token_mint: Pubkey,
+    pub token_amount: u64,
+    pub lp_amount: u64,
+}
+
+#[event]
+pub struct WithdrawEvent {
+    pub token_mint: Pubkey,
+    pub token_amount: u64,
+    pub lp_amount: u64,
+}
+
+#[event]
+pub struct BorrowEvent {
+    pub token_mint: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
+pub struct RepayEvent {
+    pub token_mint: Pubkey,
+    pub amount: u64,
+}
+
+#[error_code]
+pub enum FlashLoanError {
+    NoRepay,
+    IncorrectRepay,
+    CpiBorrow,
+    CpiRepay,
+    Borrowing,
 }

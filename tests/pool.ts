@@ -20,6 +20,7 @@ describe("flashloan", () => {
 
   const mint = Keypair.generate();
   const token1 = Keypair.generate();
+  const lp_token1 = Keypair.generate();
 
   async function create_mint(mint: Keypair, mint_authority: PublicKey) {
     await spl_token.methods
@@ -133,9 +134,91 @@ describe("flashloan", () => {
     expect(lpTokenMintAccount.mintAuthority).to.be.deep.equal(token_authority);
     expect(lpTokenMintAccount.supply.toNumber()).to.be.equal(0);
     expect(lpTokenMintAccount.decimals).to.be.equal(mintAccount.decimals);
-
-    // pool
-    // pool_token
-    // lp_token_mint
   });
+
+  it("Should add liquidity", async () => {
+    await spl_token.methods
+      .mintTo(new BN(1000000))
+      .accounts(
+        {
+          mint: mint.publicKey,
+          to: token1.publicKey,
+          authority: provider.wallet.publicKey,
+        })
+      .rpc();
+
+    const [tokenAuthority, _nonce] = await find_token_authority(flashloan.publicKey);
+    const lpTokenMint = await find_lp_token_mint(flashloan.publicKey, mint.publicKey)
+    await create_token(lp_token1, lpTokenMint, provider.wallet.publicKey);
+
+    let tokenAccount = await spl_token.account.token.fetch(token1.publicKey);
+    expect(tokenAccount.amount.toNumber()).to.be.equal(1000000);
+
+    const pool = await find_pool(flashloan.publicKey, mint.publicKey);
+    await program.methods
+      .deposit(new BN(1000000))
+      .accounts({
+        flashloan: flashloan.publicKey,
+        pool,
+        userToken: token1.publicKey,
+        userLpToken: lp_token1.publicKey,
+      })
+      .preInstructions(
+        [
+          await spl_token.methods
+            .approve(new BN(1000000))
+            .accounts({
+              source: token1.publicKey,
+              delegate: tokenAuthority,
+              authority: provider.wallet.publicKey
+            }).instruction()
+        ]
+      )
+      .rpc();
+
+    const poolAccount = await program.account.pool.fetch(pool);
+    const poolTokenAccount = await spl_token.account.token.fetch(poolAccount.poolToken);
+    const lpToken1Account = await spl_token.account.token.fetch(lp_token1.publicKey);
+
+    expect(poolTokenAccount.amount.toNumber()).to.be.equal(1000000);
+    expect(lpToken1Account.amount.toNumber()).to.be.equal(1000000);
+  })
+
+  it("Should remove liquidity", async () => {
+    const [tokenAuthority, _nonce] = await find_token_authority(flashloan.publicKey);
+    const pool = await find_pool(flashloan.publicKey, mint.publicKey);
+
+    let lpTokenAccount = await spl_token.account.token.fetch(lp_token1.publicKey);
+    let tokenAccount = await spl_token.account.token.fetch(token1.publicKey);
+    expect(lpTokenAccount.amount.toNumber()).to.be.equal(1000000);
+    expect(tokenAccount.amount.toNumber()).to.be.equal(0);
+
+    await program.methods
+      .withdraw(new BN(1000000))
+      .accounts(
+        {
+          flashloan: flashloan.publicKey,
+          pool,
+          userToken: token1.publicKey,
+          userLpToken: lp_token1.publicKey,
+        })
+      .preInstructions(
+        [
+          await spl_token.methods
+            .approve(new BN(1000000))
+            .accounts({
+              source: lp_token1.publicKey,
+              delegate: tokenAuthority,
+              authority: provider.wallet.publicKey
+            }).instruction()
+        ]
+      )
+      .rpc();
+
+    lpTokenAccount = await spl_token.account.token.fetch(lp_token1.publicKey);
+    tokenAccount = await spl_token.account.token.fetch(token1.publicKey);
+    expect(lpTokenAccount.amount.toNumber()).to.be.equal(0);
+    expect(tokenAccount.amount.toNumber()).to.be.equal(1000000);
+  });
+
 });
