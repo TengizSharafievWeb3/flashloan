@@ -137,14 +137,17 @@ pub mod flashloan {
 
         // loop through instructions, looking for an equivalent repay to this borrow
         let mut idx = current_idx + 1;
+        let expected_sighash = u64::from_be_bytes(Repay::SIGHASH[..8].try_into().unwrap());
+
         loop {
             // get the next instruction, die if theres no more
             if let Ok(ixn) = instructions::load_instruction_at_checked(idx, &ixns) {
+                let actual_sighash = u64::from_be_bytes(ixn.data[..8].try_into().unwrap());
+
                 // check if we have a toplevel repay toward the same pool
                 // if so, confirm the amount, otherwise next instruction
                 if ixn.program_id == *ctx.program_id
-                    && u64::from_be_bytes(ixn.data[..8].try_into().unwrap()) ==
-                        u64::from_be_bytes(Repay::SIGHASH[..8].try_into().unwrap())
+                    && actual_sighash == expected_sighash
                     && ixn.accounts[2].pubkey == ctx.accounts.pool.key() {
                     if u64::from_le_bytes(ixn.data[8..16].try_into().unwrap()) == amount {
                         break;
@@ -467,9 +470,9 @@ pub struct Repay<'info> {
 impl Repay<'_> {
     // https://github.com/project-serum/anchor/blob/9e070870f4815849e99f19700d675638d3443b8f/lang/syn/src/codegen/program/dispatch.rs#L119
     //
-    // Sha256("global::<rust-identifier>")[..8],
+    // Sha256("global:<rust-identifier>")[..8],
     const SIGHASH: [u8; 32] = Sha256::new()
-        .update(b"global::repay")
+        .update(b"global:repay")
         .finalize();
 }
 

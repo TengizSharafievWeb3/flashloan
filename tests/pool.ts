@@ -4,11 +4,9 @@ import {PublicKey, Keypair} from '@solana/web3.js';
 import { Flashloan } from "../target/types/flashloan";
 
 import { expect } from 'chai';
-import * as chai from 'chai';
-import chaiAsPromised from 'chai-as-promised';
-chai.use(chaiAsPromised);
 
-describe("flashloan", () => {
+
+describe("pool", () => {
   // Configure the client to use the local cluster.
   anchor.setProvider(anchor.Provider.env());
   const provider = anchor.getProvider();
