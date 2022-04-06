@@ -201,4 +201,77 @@ describe("flashloan", () => {
 
 
   });
+
+  it("Should borrow and repay with discount", async() => {
+    const pool = await find_pool(flashloan.publicKey, mint.publicKey);
+    const [tokenAuthority, _nonce] = await find_token_authority(flashloan.publicKey);
+    const poolToken = await find_pool_token(flashloan.publicKey, mint.publicKey);
+
+    let poolTokenAccount = await spl_token.account.token.fetch(poolToken);
+    const poolTokenAmountBefore = poolTokenAccount.amount;
+
+    const voucher = Keypair.generate();
+    await program.methods.mintVoucher()
+      .accounts({
+        flashloan: flashloan.publicKey,
+        authority: authority.publicKey,
+        pool,
+        voucher: voucher.publicKey,
+        payer: provider.wallet.publicKey,
+      })
+      .signers([authority, voucher])
+      .rpc();
+
+    const voucherAccount = await program.account.voucher.fetch(voucher.publicKey);
+    expect(voucherAccount.pool).to.be.deep.equal(pool);
+
+    await spl_token.methods
+      .mintTo(new BN(0.1 * web3.LAMPORTS_PER_SOL))
+      .accounts(
+        {
+          mint: mint.publicKey,
+          to: token2.publicKey,
+          authority: provider.wallet.publicKey,
+        })
+      .rpc();
+
+    const borrowInstruction = await program.methods
+      .borrow(new BN(100 * web3.LAMPORTS_PER_SOL))
+      .accounts({
+        flashloan: flashloan.publicKey,
+        pool,
+        userToken: token2.publicKey,
+        instructions: web3.SYSVAR_INSTRUCTIONS_PUBKEY,
+      }).signers([voucher]).instruction();
+
+    // Add voucher account
+    borrowInstruction.keys.push({
+      isSigner: true,
+      isWritable: false,
+      pubkey: voucher.publicKey,
+    })
+
+    await program.methods
+      .repay(new BN(100.05 * web3.LAMPORTS_PER_SOL))
+      .accounts({
+        flashloan: flashloan.publicKey,
+        pool,
+        userToken: token2.publicKey,
+        instructions: web3.SYSVAR_INSTRUCTIONS_PUBKEY,
+      })
+      .preInstructions(
+        [
+          await spl_token.methods
+            .approve(new BN(101 * web3.LAMPORTS_PER_SOL))
+            .accounts({
+              source: token2.publicKey,
+              delegate: tokenAuthority,
+              authority: provider.wallet.publicKey,
+            }).instruction(),
+          borrowInstruction,
+        ]
+      )
+      .signers([voucher])
+      .rpc();
+  });
 });
