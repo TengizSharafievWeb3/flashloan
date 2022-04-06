@@ -4,20 +4,27 @@ use anchor_lang::solana_program::sysvar::instructions;
 use std::convert::TryInto;
 use sha2_const::Sha256;
 
+mod calc;
+
 declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 
 #[program]
 pub mod flashloan {
+    use crate::calc::{shares_from_value, value_from_shares};
     use super::*;
 
-    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
+    pub fn initialize(ctx: Context<Initialize>, basis_points: u32) -> Result<()> {
         let flashloan = &mut ctx.accounts.flashloan;
 
         flashloan.token_authority_bump = *ctx.bumps.get("token_authority").unwrap();
         flashloan.authority = ctx.accounts.authority.key();
+        // TODO: Add check that fee less than 10%
+        flashloan.fee = Fee::from_basis_points(basis_points);
 
         Ok(())
     }
+
+    // TODO: Add instruction for fee setup
 
     /// Add pool for a given token mint, setup a pool, token account and lp token mint
     pub fn add_pool(ctx: Context<AddPool>) -> Result<()> {
@@ -28,13 +35,24 @@ pub mod flashloan {
         pool.token_mint = ctx.accounts.token_mint.key();
         pool.pool_token = ctx.accounts.pool_token.key();
         pool.lp_token_mint = ctx.accounts.lp_token_mint.key();
+        // TODO: independent fee setup for pools
+        pool.fee = ctx.accounts.flashloan.fee;
 
         Ok(())
     }
 
     /// Receive tokens and mint lp tokens
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
-        // TODO: Add fee math
+        require!(!ctx.accounts.pool.borrowing, FlashLoanError::Borrowing);
+
+        // we need to compute how many tokens return for LP-shares
+        let lp_supply = ctx.accounts.lp_token_mint.supply;
+        let token_supply = ctx.accounts.pool_token.amount;
+        let shares_for_user = shares_from_value(
+            amount,
+            token_supply,
+            lp_supply,
+        )?;
 
         let key = ctx.accounts.flashloan.key();
         let seeds = &[
@@ -65,12 +83,12 @@ pub mod flashloan {
             singer_seeds,
         );
 
-        token::mint_to(mint_ctx, amount)?;
+        token::mint_to(mint_ctx, shares_for_user)?;
 
         emit!(DepositEvent {
             token_mint: ctx.accounts.pool.token_mint,
             token_amount: amount,
-            lp_amount: amount
+            lp_amount: shares_for_user,
         });
 
         Ok(())
@@ -78,7 +96,15 @@ pub mod flashloan {
 
     /// Burn lp and pay out tokens
     pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
-        // TODO: Add fee math
+        require!(!ctx.accounts.pool.borrowing, FlashLoanError::Borrowing);
+
+        let lp_supply = ctx.accounts.lp_token_mint.supply;
+        let token_supply = ctx.accounts.pool_token.amount;
+        let tokens_for_user = value_from_shares(
+            amount,
+            token_supply,
+            lp_supply,
+        )?;
 
         let key = ctx.accounts.flashloan.key();
         let seeds = &[
@@ -109,11 +135,11 @@ pub mod flashloan {
             singer_seeds,
         );
 
-        token::transfer(transfer_ctx, amount)?;
+        token::transfer(transfer_ctx, tokens_for_user)?;
 
         emit!(WithdrawEvent {
             token_mint: ctx.accounts.pool.token_mint,
-            token_amount: amount,
+            token_amount: tokens_for_user,
             lp_amount: amount
         });
 
@@ -138,6 +164,10 @@ pub mod flashloan {
         // loop through instructions, looking for an equivalent repay to this borrow
         let mut idx = current_idx + 1;
         let expected_sighash = u64::from_be_bytes(Repay::SIGHASH[..8].try_into().unwrap());
+        let expected_repay =
+            amount
+            .checked_add(ctx.accounts.pool.fee.apply(amount))
+                .ok_or_else(|| error!(FlashLoanError::CalculationFailure))?;
 
         loop {
             // get the next instruction, die if theres no more
@@ -149,7 +179,7 @@ pub mod flashloan {
                 if ixn.program_id == *ctx.program_id
                     && actual_sighash == expected_sighash
                     && ixn.accounts[2].pubkey == ctx.accounts.pool.key() {
-                    if u64::from_le_bytes(ixn.data[8..16].try_into().unwrap()) == amount {
+                    if u64::from_le_bytes(ixn.data[8..16].try_into().unwrap()) == expected_repay {
                         break;
                     } else {
                         return Err(error!(FlashLoanError::IncorrectRepay));
@@ -478,25 +508,45 @@ impl Repay<'_> {
 
 #[account]
 pub struct FlashLoan {
-    token_authority_bump: u8,
-    authority: Pubkey,
+    pub token_authority_bump: u8,
+    pub authority: Pubkey,
+    pub fee: Fee,
 }
 
 impl FlashLoan {
-    const LEN: usize = 8 + 32 + 1;
+    const LEN: usize = 8 + 1 + 32 + 4;
 }
 
 #[account]
 pub struct Pool {
-    bump: u8,
-    borrowing: bool,
-    token_mint: Pubkey,
-    pool_token: Pubkey,
-    lp_token_mint: Pubkey,
+    pub bump: u8,
+    pub borrowing: bool,
+    pub fee: Fee,
+    pub token_mint: Pubkey,
+    pub pool_token: Pubkey,
+    pub lp_token_mint: Pubkey,
 }
 
 impl Pool {
-    const LEN: usize = 8 + 2 + 32*3;
+    const LEN: usize = 8 + 2 + 32*3 + 4;
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, AnchorSerialize, AnchorDeserialize, PartialEq, Eq, PartialOrd, Ord,
+)]
+pub struct Fee {
+    pub basis_points: u32,
+}
+
+impl Fee {
+    pub fn from_basis_points(basis_points: u32) -> Self {
+        Self { basis_points }
+    }
+
+    pub fn apply(&self, amount: u64) -> u64 {
+        // LMT no error possible
+        (amount as u128 * self.basis_points as u128 / 10_000_u128) as u64
+    }
 }
 
 // -----------------------------------------------------------------------------------------------
@@ -534,4 +584,5 @@ pub enum FlashLoanError {
     CpiBorrow,
     CpiRepay,
     Borrowing,
+    CalculationFailure,
 }

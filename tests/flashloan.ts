@@ -89,7 +89,7 @@ describe("flashloan", () => {
     await create_token(token2, mint.publicKey, provider.wallet.publicKey);
 
     await spl_token.methods
-      .mintTo(new BN(1000 * web3.LAMPORTS_PER_SOL))
+      .mintTo(new BN(1001 * web3.LAMPORTS_PER_SOL))
       .accounts(
         {
           mint: mint.publicKey,
@@ -99,7 +99,7 @@ describe("flashloan", () => {
       .rpc();
 
     await program.methods
-      .initialize()
+      .initialize(10)
       .accounts({
         flashloan: flashloan.publicKey,
         authority: authority.publicKey,
@@ -147,9 +147,23 @@ describe("flashloan", () => {
   it("Should borrow and repay", async () => {
     const pool = await find_pool(flashloan.publicKey, mint.publicKey);
     const [tokenAuthority, _nonce] = await find_token_authority(flashloan.publicKey);
+    const poolToken = await find_pool_token(flashloan.publicKey, mint.publicKey);
+
+    let poolTokenAccount = await spl_token.account.token.fetch(poolToken);
+    expect(poolTokenAccount.amount.toNumber()).to.be.equal(1000 * web3.LAMPORTS_PER_SOL);
+
+    await spl_token.methods
+      .mintTo(new BN(0.1 * web3.LAMPORTS_PER_SOL))
+      .accounts(
+        {
+          mint: mint.publicKey,
+          to: token2.publicKey,
+          authority: provider.wallet.publicKey,
+        })
+      .rpc();
 
     await program.methods
-      .borrow(new BN(10 * web3.LAMPORTS_PER_SOL))
+      .borrow(new BN(100 * web3.LAMPORTS_PER_SOL))
       .accounts({
         flashloan: flashloan.publicKey,
         pool,
@@ -159,7 +173,7 @@ describe("flashloan", () => {
       .preInstructions(
         [
           await spl_token.methods
-            .approve(new BN(10 * web3.LAMPORTS_PER_SOL))
+            .approve(new BN(101 * web3.LAMPORTS_PER_SOL))
             .accounts({
               source: token2.publicKey,
               delegate: tokenAuthority,
@@ -170,7 +184,7 @@ describe("flashloan", () => {
       .postInstructions(
         [
           await program.methods
-            .repay(new BN(10 * web3.LAMPORTS_PER_SOL))
+            .repay(new BN(100.1 * web3.LAMPORTS_PER_SOL))
             .accounts({
               flashloan: flashloan.publicKey,
               pool,
@@ -181,5 +195,10 @@ describe("flashloan", () => {
         ]
       )
       .rpc();
+
+    poolTokenAccount = await spl_token.account.token.fetch(poolToken);
+    expect(poolTokenAccount.amount.toNumber()).to.be.equal(1000.1 * web3.LAMPORTS_PER_SOL);
+
+
   });
 });
