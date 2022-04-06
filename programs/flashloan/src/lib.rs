@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use anchor_lang::AccountDeserialize;
 use anchor_spl::token::{self, Mint, TokenAccount, MintTo, Burn, Transfer, Token};
 use anchor_lang::solana_program::sysvar::instructions;
 use std::convert::TryInto;
@@ -13,21 +14,17 @@ pub mod flashloan {
     use crate::calc::{shares_from_value, value_from_shares};
     use super::*;
 
-    pub fn initialize(ctx: Context<Initialize>, basis_points: u32) -> Result<()> {
+    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
         let flashloan = &mut ctx.accounts.flashloan;
 
         flashloan.token_authority_bump = *ctx.bumps.get("token_authority").unwrap();
         flashloan.authority = ctx.accounts.authority.key();
-        // TODO: Add check that fee less than 10%
-        flashloan.fee = Fee::from_basis_points(basis_points);
 
         Ok(())
     }
 
-    // TODO: Add instruction for fee setup
-
     /// Add pool for a given token mint, setup a pool, token account and lp token mint
-    pub fn add_pool(ctx: Context<AddPool>) -> Result<()> {
+    pub fn add_pool(ctx: Context<AddPool>, fee: u32, discounted_fee: u32) -> Result<()> {
         let pool = &mut ctx.accounts.pool;
 
         pool.bump = *ctx.bumps.get("pool").unwrap();
@@ -35,8 +32,8 @@ pub mod flashloan {
         pool.token_mint = ctx.accounts.token_mint.key();
         pool.pool_token = ctx.accounts.pool_token.key();
         pool.lp_token_mint = ctx.accounts.lp_token_mint.key();
-        // TODO: independent fee setup for pools
-        pool.fee = ctx.accounts.flashloan.fee;
+        pool.fee = Fee::from_basis_points(fee);
+        pool.discounted_fee = Fee::from_basis_points(discounted_fee);
 
         Ok(())
     }
@@ -147,6 +144,9 @@ pub mod flashloan {
     }
 
     pub fn mint_voucher(ctx: Context<MintVoucher>) -> Result<()> {
+        let voucher = &mut ctx.accounts.voucher;
+        voucher.pool = ctx.accounts.pool.key();
+
         Ok(())
     }
 
@@ -164,9 +164,12 @@ pub mod flashloan {
         // loop through instructions, looking for an equivalent repay to this borrow
         let mut idx = current_idx + 1;
         let expected_sighash = u64::from_be_bytes(Repay::SIGHASH[..8].try_into().unwrap());
+
+        let fee = if !Voucher::is_discounted_borrow(&ctx) { &ctx.accounts.pool.fee } else { &ctx.accounts.pool.discounted_fee };
+
         let expected_repay =
             amount
-            .checked_add(ctx.accounts.pool.fee.apply(amount))
+            .checked_add(fee.apply(amount))
                 .ok_or_else(|| error!(FlashLoanError::CalculationFailure))?;
 
         loop {
@@ -425,7 +428,26 @@ pub struct Withdraw<'info> {
 }
 
 #[derive(Accounts)]
-pub struct MintVoucher {}
+pub struct MintVoucher<'info> {
+    #[account(has_one = authority)]
+    pub flashloan: Account<'info, FlashLoan>,
+
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [flashloan.key().as_ref(), pool.token_mint.as_ref()],
+        bump = pool.bump
+    )]
+    pub pool: Account<'info, Pool>,
+
+    #[account(init, payer = payer, space = Voucher::LEN)]
+    pub voucher: Account<'info, Voucher>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
 
 #[derive(Accounts)]
 pub struct Borrow<'info> {
@@ -510,11 +532,10 @@ impl Repay<'_> {
 pub struct FlashLoan {
     pub token_authority_bump: u8,
     pub authority: Pubkey,
-    pub fee: Fee,
 }
 
 impl FlashLoan {
-    const LEN: usize = 8 + 1 + 32 + 4;
+    const LEN: usize = 8 + 1 + 32;
 }
 
 #[account]
@@ -522,13 +543,14 @@ pub struct Pool {
     pub bump: u8,
     pub borrowing: bool,
     pub fee: Fee,
+    pub discounted_fee: Fee,
     pub token_mint: Pubkey,
     pub pool_token: Pubkey,
     pub lp_token_mint: Pubkey,
 }
 
 impl Pool {
-    const LEN: usize = 8 + 2 + 32*3 + 4;
+    const LEN: usize = 8 + 2 + 32*3 + 4*2;
 }
 
 #[derive(
@@ -546,6 +568,34 @@ impl Fee {
     pub fn apply(&self, amount: u64) -> u64 {
         // LMT no error possible
         (amount as u128 * self.basis_points as u128 / 10_000_u128) as u64
+    }
+}
+
+#[account]
+pub struct Voucher {
+    pub pool: Pubkey,
+}
+
+impl Voucher {
+    const LEN: usize = 8 + 32;
+
+    fn is_discounted_borrow(ctx: &Context<Borrow>) -> bool {
+        // Optional discount voucher account
+        if let Some(voucher) = ctx.remaining_accounts.get(0) {
+            voucher.owner == ctx.program_id &&
+                voucher.is_signer == true &&
+                voucher.is_writable == false &&
+                {
+                    let data = &*voucher.try_borrow_data().unwrap();
+                    if let Ok(voucher_data) = Voucher::try_deserialize(&mut &data[..]) {
+                        voucher_data.pool == ctx.accounts.pool.key()
+                    } else {
+                        false
+                    }
+                }
+        } else {
+            false
+        }
     }
 }
 

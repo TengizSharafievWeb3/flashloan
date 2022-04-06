@@ -87,7 +87,7 @@ describe("pool", () => {
 
   it("Should initialize flashloan", async () => {
     await program.methods
-      .initialize(10)
+      .initialize()
       .accounts({
         flashloan: flashloan.publicKey,
         authority: authority.publicKey,
@@ -104,7 +104,7 @@ describe("pool", () => {
 
   it("Should add pool", async () => {
     await program.methods
-      .addPool()
+      .addPool(10, 5)
       .accounts({
         flashloan: flashloan.publicKey,
         authority: authority.publicKey,

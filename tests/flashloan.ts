@@ -99,7 +99,7 @@ describe("flashloan", () => {
       .rpc();
 
     await program.methods
-      .initialize(10)
+      .initialize()
       .accounts({
         flashloan: flashloan.publicKey,
         authority: authority.publicKey,
@@ -108,7 +108,7 @@ describe("flashloan", () => {
       .rpc();
 
     await program.methods
-      .addPool()
+      .addPool(10, 5)
       .accounts({
         flashloan: flashloan.publicKey,
         authority: authority.publicKey,
